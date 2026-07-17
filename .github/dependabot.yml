@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Keep the GitHub Actions used in build.yml current (and on supported Node
+  # runtimes). Monthly cadence keeps PR noise low; merging each PR yourself is
+  # also "user activity" that resets the 60-day scheduled-workflow disable timer.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
