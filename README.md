@@ -5,10 +5,6 @@ releases as **signed, notarized macOS DMGs with the `boxmot` tracking extra bund
 (BoT-SORT / DeepOCSORT / ByteTrack + OSNet ReID) — the features the default
 torch-free upstream DMG omits.
 
-This repo contains **no AutoPTZ source**, only one workflow
-([`.github/workflows/build.yml`](.github/workflows/build.yml)). It is **not a fork**,
-so there is nothing to sync and no merge conflicts, ever.
-
 ## How it works
 
 Daily (and on demand), the workflow:
@@ -23,16 +19,3 @@ Daily (and on demand), the workflow:
 
 Install once from this repo's [Releases](../../releases); after that the app
 auto-updates itself from here.
-
-## Required secrets
-
-Set on this repo (Settings → Secrets and variables → Actions):
-
-| Secret | Purpose |
-| --- | --- |
-| `MACOS_CERTIFICATE_P12_BASE64` | base64 of the Developer ID Application `.p12` |
-| `MACOS_CERTIFICATE_PASSWORD` | password for that `.p12` |
-| `MACOS_SIGN_IDENTITY` | e.g. `Developer ID Application: NAME (TEAMID)` |
-| `MACOS_NOTARY_APPLE_ID` | Apple ID used for notarization |
-| `MACOS_NOTARY_TEAM_ID` | Apple Developer Team ID |
-| `MACOS_NOTARY_PASSWORD` | app-specific password from appleid.apple.com |
