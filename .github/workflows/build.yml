@@ -83,7 +83,7 @@ jobs:
     timeout-minutes: 90
     steps:
       # Check out the UPSTREAM source at the exact release tag we are packaging.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.check.outputs.tag }}
