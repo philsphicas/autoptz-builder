@@ -1,0 +1,22 @@
+# Auto-merge Dependabot PRs. Guarded to dependabot[bot]; fork PRs never receive
+# a write token, so this cannot merge an external PR.
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      # Fall back to an immediate merge when auto-merge can't be enabled (this
+      # repo has no required status checks to gate on).
+      - name: Merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --squash "$PR_URL" || gh pr merge --squash "$PR_URL"
