@@ -1,0 +1,3 @@
+# Source-code fixes (unified diffs) are applied from here with `git apply`
+# before scripts/apply_edits.py runs. See ../PATCHES.md for the mechanism and
+# provenance policy.

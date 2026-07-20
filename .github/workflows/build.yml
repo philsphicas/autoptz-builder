@@ -1,18 +1,33 @@
 # Build a signed, notarized macOS DMG of the latest upstream AutoPTZ stable
 # release, with the boxmot tracking extra bundled and the in-app updater pointed
-# at this repo. Upstream source is checked out at the release tag and patched at
-# build time; nothing from AutoPTZ is committed here.
+# at this repo. Upstream source is checked out at the resolved release commit and
+# patched at build time; nothing from AutoPTZ is committed here.
+#
+# Builder-owned edits live in scripts/apply_edits.py (guarded value edits) and
+# patches/*.patch (static source diffs). See PATCHES.md.
 name: AutoPTZ BoxMOT build
 
 on:
+  # A push that changes build inputs runs a dry-run build (validation only); the
+  # nightly schedule publishes when inputs have changed. See the check job.
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "patches/**"
+      - ".github/workflows/build.yml"
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: "Build even if this repo already ships the latest upstream tag."
+        description: "Build a new .postN even if build inputs are unchanged."
         type: boolean
         default: false
+      publish:
+        description: "Publish a release. Uncheck for a dry run (build/sign/notarize + artifacts only)."
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -29,29 +44,90 @@ jobs:
     name: Check for new upstream release
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.decide.outputs.tag }}
       should_build: ${{ steps.decide.outputs.should_build }}
+      publish: ${{ steps.decide.outputs.publish }}
+      upstream_tag: ${{ steps.decide.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.decide.outputs.upstream_sha }}
+      builder_sha: ${{ steps.decide.outputs.builder_sha }}
+      release_tag: ${{ steps.decide.outputs.release_tag }}
+      version: ${{ steps.decide.outputs.version }}
+      short_version: ${{ steps.decide.outputs.short_version }}
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - id: decide
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force }}
+          PUBLISH: ${{ github.event.inputs.publish }}
+          EVENT: ${{ github.event_name }}
+          BUILDER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           # /releases/latest is the newest stable (non-prerelease) release, which
           # matches the app's default update channel.
-          up="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" -q .tag_name)"
-          mine="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" -q .tag_name 2>/dev/null || echo "")"
-          echo "upstream latest: ${up:-<none>}"
-          echo "this repo latest: ${mine:-<none>}"
-          force="${{ github.event.inputs.force }}"
-          if [ -z "${up}" ]; then
+          upstream_tag="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" -q .tag_name)"
+          echo "upstream latest tag: ${upstream_tag:-<none>}"
+          if [ -z "${upstream_tag}" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-          elif [ "${up}" != "${mine}" ] || [ "${force}" = "true" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "tag=${up}" >> "$GITHUB_OUTPUT"
+
+          # Tags are mutable; resolve to an immutable commit so both matrix arches
+          # build byte-identical source. Works for annotated + lightweight tags.
+          upstream_sha="$(gh api "repos/${UPSTREAM_REPO}/commits/${upstream_tag}" -q .sha)"
+          echo "upstream sha: ${upstream_sha}"
+
+          # Publish policy by event: a push validates only (dry run); the schedule
+          # publishes when inputs changed (self-healing); a manual run honours the
+          # publish input (default true).
+          case "$EVENT" in
+            push) publish=false ;;
+            workflow_dispatch) [ "$PUBLISH" = "false" ] && publish=false || publish=true ;;
+            *) publish=true ;;
+          esac
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+
+          # The build is determined by (upstream commit, builder commit). Each
+          # release records both in build-manifest.json, so we rebuild whenever
+          # either changed — a new upstream version, or a builder-side fix against
+          # an unchanged upstream — without needing a manual force.
+          export RELEASE_TAGS="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate -q '.[].tag_name' || true)"
+          # Newest already-published release matching this upstream base version.
+          latest_tag="$(python3 - "$upstream_tag" <<'PY'
+          import os, re, sys
+          base = re.sub(r"\.post\d+$", "", re.sub(r"^v", "", sys.argv[1]))
+          pat = re.compile(rf"^v{re.escape(base)}(?:\.post(\d+))?$")
+          best, best_n = "", -1
+          for t in os.environ.get("RELEASE_TAGS", "").split():
+              m = pat.match(t.strip())
+              if m:
+                  n = int(m.group(1)) if m.group(1) else 0
+                  if n > best_n:
+                      best, best_n = t.strip(), n
+          print(best)
+          PY
+          )"
+          prev_manifest=""
+          if [ -n "$latest_tag" ]; then
+            if gh release download "$latest_tag" --repo "$GITHUB_REPOSITORY" \
+                 -p build-manifest.json -O prev-manifest.json 2>/dev/null; then
+              prev_manifest="prev-manifest.json"
+              echo "comparing build inputs against ${latest_tag}"
+            else
+              echo "${latest_tag} predates build manifests; will refresh it"
+            fi
+          fi
+
+          python3 scripts/decide_release.py \
+            --upstream-tag "$upstream_tag" \
+            --upstream-sha "$upstream_sha" \
+            --builder-sha "$BUILDER_SHA" \
+            --force "${FORCE:-false}" \
+            --prev-manifest "$prev_manifest" >> "$GITHUB_OUTPUT"
+
+          echo "upstream_tag=${upstream_tag}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          echo "builder_sha=${BUILDER_SHA}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.arch }} DMG
@@ -68,28 +144,62 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Sibling checkouts: upstream source (immutable SHA) + this builder repo.
+      # Build steps run inside upstream/; builder files are referenced by path.
+      - name: Checkout upstream source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ needs.check.outputs.tag }}
+          ref: ${{ needs.check.outputs.upstream_sha }}
+          path: upstream
+      - name: Checkout builder
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: builder
 
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
+          # Cache pip's download cache so the heavy ML wheels (PySide6_Addons
+          # ~302 MB, torch ~200 MB) aren't re-streamed from PyPI every run —
+          # faster, and it shrinks the window for a mid-download TLS reset.
+          # Keyed on the pristine upstream requirements (apply_edits rewrites
+          # them later, but the key only needs to be stable per upstream ref).
+          cache: pip
+          cache-dependency-path: upstream/requirements/*.txt
 
-      - name: Point updater at this repo
+      # Source patches. Depth-1, no --3way: a stale patch fails loudly
+      # rather than silently 3-way merging into a signed release.
+      - name: Apply source patches
+        working-directory: upstream
         run: |
           set -euo pipefail
-          python - "$GITHUB_REPOSITORY" <<'PY'
-          import pathlib, re, sys
-          repo = sys.argv[1]
-          p = pathlib.Path("autoptz/update/checker.py")
-          s = p.read_text()
-          s2 = re.sub(r'DEFAULT_REPO = "[^"]+"', f'DEFAULT_REPO = "{repo}"', s, count=1)
-          assert s2 != s, "DEFAULT_REPO line not found — upstream layout changed"
-          p.write_text(s2)
-          print(f"DEFAULT_REPO -> {repo}")
-          PY
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/builder/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No source patches to apply."
+          fi
+          # macOS bash 3.2 treats "${arr[@]}" on an empty array as unbound under
+          # set -u, so guard the expansion.
+          for p in ${patches[@]+"${patches[@]}"}; do
+            echo "Applying $(basename "$p")"
+            git apply --check "$p"
+            git apply "$p"
+          done
+
+      # Scripted edits: updater redirect, version stamp (all surfaces),
+      # dependency pins. Each asserts an exact single match (loud on drift).
+      # Stamped BEFORE the editable install so importlib.metadata agrees.
+      - name: Apply builder edits
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/builder/scripts/apply_edits.py" \
+            --repo "$GITHUB_REPOSITORY" \
+            --version "${{ needs.check.outputs.version }}" \
+            --short-version "${{ needs.check.outputs.short_version }}" \
+            --build-number "${{ github.run_number }}"
+          plutil -lint packaging/Info.plist
 
       - name: Import Developer ID certificate
         env:
@@ -118,15 +228,57 @@ jobs:
           fi
 
       - name: Install dependencies (with boxmot)
+        working-directory: upstream
+        env:
+          # The ML wheels stream over a single long HTTPS connection; a transient
+          # TLS reset mid-download surfaces as pip ProtocolError(IncompleteRead)
+          # and — since pip's resume path doesn't catch every such error — kills
+          # the step (observed live on the 302 MB PySide6_Addons wheel). Harden
+          # the socket and let pip resume; the retry loop below is the real net.
+          PIP_RETRIES: "5"
+          PIP_TIMEOUT: "120"
+          PIP_RESUME_RETRIES: "10"
         run: |
           set -euo pipefail
           python -m venv .venv
-          .venv/bin/python tools/install.py \
-            --upgrade-pip --packaging --with-tracking --editable --accelerator cpu
+          # Retry the whole install on transient download failures. install.py is
+          # idempotent and pip's cache means a retry re-fetches only the wheel
+          # that actually failed, not the whole ~600 MB set. Mirrors the codesign
+          # and hdiutil retries elsewhere — belt-and-suspenders for CI network luck.
+          for attempt in 1 2 3; do
+            if .venv/bin/python tools/install.py \
+                --upgrade-pip --packaging --with-tracking --editable --accelerator cpu; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "!! dependency install failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "!! dependency install failed (attempt ${attempt}/3) — retrying in $(( attempt * 15 ))s…" >&2
+            sleep "$(( attempt * 15 ))"
+          done
+
+      # Consistency gate: the DMG filename, the updater's self-version and the
+      # installed package metadata all derive from autoptz.__version__ - assert
+      # they agree before we sign anything.
+      - name: Verify version consistency
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          .venv/bin/python - "${{ needs.check.outputs.version }}" <<'PY'
+          import importlib.metadata as m, sys
+          import autoptz
+          expected = sys.argv[1]
+          meta = m.version("autoptz")
+          assert autoptz.__version__ == expected, (autoptz.__version__, expected)
+          assert meta == expected, (meta, expected)
+          print(f"version OK: {expected}")
+          PY
 
       # SKIP_INSTALL reuses the venv above (which includes boxmot) instead of the
       # script's default torch-free install.
       - name: Build signed + notarized DMG
+        working-directory: upstream
         env:
           SKIP_INSTALL: "1"
           MAKE_DMG: "1"
@@ -140,13 +292,14 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dmg-${{ matrix.arch }}
-          path: dist/*.dmg
+          path: upstream/dist/*.dmg
           if-no-files-found: error
           compression-level: 0
 
   publish:
-    name: Publish release ${{ needs.check.outputs.tag }}
+    name: Publish release ${{ needs.check.outputs.release_tag }}
     needs: [check, build]
+    if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -161,21 +314,39 @@ jobs:
           cd out
           sha256sum ./*.dmg | sed 's# \./#  #' > SHA256SUMS
           cat SHA256SUMS
-      - name: Publish / update release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.check.outputs.tag }}
+          TAG: ${{ needs.check.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream_sha }}
+          BUILDER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          notes="Automated build of upstream ${TAG} with the **boxmot** tracking extra bundled (BoT-SORT/DeepOCSORT/ByteTrack + OSNet ReID). The in-app updater on these builds tracks this repo.
+          # Machine-readable provenance the check job reads to decide whether a
+          # future run needs to rebuild (upstream commit or builder commit changed).
+          cat > out/build-manifest.json <<EOF
+          {
+            "release_tag": "${TAG}",
+            "upstream_repo": "${UPSTREAM_REPO}",
+            "upstream_tag": "${UPSTREAM_TAG}",
+            "upstream_sha": "${UPSTREAM_SHA}",
+            "builder_sha": "${BUILDER_SHA}",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          cat out/build-manifest.json
+          notes="Automated build of upstream ${UPSTREAM_TAG} with the **boxmot** tracking extra bundled (BoT-SORT/DeepOCSORT/ByteTrack + OSNet ReID). The in-app updater on these builds tracks this repo.
 
-          Upstream source: https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}"
+          Provenance:
+          - Upstream source: https://github.com/${UPSTREAM_REPO}/releases/tag/${UPSTREAM_TAG} (\`${UPSTREAM_SHA}\`)
+          - Builder: ${GITHUB_REPOSITORY}@\`${BUILDER_SHA}\`"
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" out/* --repo "${GITHUB_REPOSITORY}" --clobber
-          else
-            gh release create "${TAG}" out/* \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "AutoPTZ ${TAG} (BoxMOT build)" \
-              --notes "${notes}" \
-              --latest
+            echo "::error::Release ${TAG} already exists - post scheme should have picked a new tag."
+            exit 1
           fi
+          gh release create "${TAG}" out/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "AutoPTZ ${TAG} (BoxMOT build)" \
+            --notes "${notes}" \
+            --latest

@@ -1,0 +1,78 @@
+Retry codesign when Apple's secure-timestamp server is transiently unavailable.
+
+codesign's `--timestamp` step contacts Apple's RFC-3161 timestamp server, which
+intermittently answers "The timestamp service is not available." A single build
+signs 200+ nested Mach-O binaries (every dylib/.so plus suffix-less PyInstaller
+binaries), so even a low per-call failure rate reliably sinks a build. This has
+already killed the release-gating x86_64 build once (a green arm64 build on the
+identical commit proved it was purely transient, not a signing problem).
+
+Upstream already retries the analogous hdiutil flake in create_dmg(); this adds
+the same treatment for codesign via a codesign_with_retry() wrapper (5 attempts,
+linear backoff), routing all three executed `--timestamp` sites (nested Mach-O
+loop, app bundle, DMG) through it. The retry fires ONLY on the timestamp-service
+message so genuine signing errors still fail fast. Worth proposing to
+AutoPTZ/autoptz -- it hardens their own release builds identically.
+
+diff --git a/packaging/build_macos.sh b/packaging/build_macos.sh
+index e65dbee..b9a3d84 100755
+--- a/packaging/build_macos.sh
++++ b/packaging/build_macos.sh
+@@ -54,13 +54,38 @@ require_developer_id_signature() {
+     fi
+ }
+ 
++# codesign's --timestamp step contacts Apple's secure timestamp server, which
++# intermittently answers "The timestamp service is not available." — a transient
++# network flake, not a signing problem. A single build signs 200+ nested Mach-O
++# binaries, so even a low per-call failure rate reliably sinks a build (and, on
++# the release-gating arch, the whole cross-platform release). Retry only on that
++# flake, mirroring create_dmg's hdiutil retry; any other codesign error fails
++# fast so real problems aren't masked.
++codesign_with_retry() {
++    local attempt out
++    for (( attempt = 1; attempt <= 5; attempt++ )); do
++        if out="$(codesign "$@" 2>&1)"; then
++            [[ -n "${out}" ]] && printf '%s\n' "${out}"
++            return 0
++        fi
++        printf '%s\n' "${out}" >&2
++        if (( attempt < 5 )) && printf '%s' "${out}" | grep -qi "timestamp service is not available"; then
++            echo "!! codesign hit the timestamp-service flake (attempt ${attempt}/5) — retrying in $(( attempt * 5 ))s…" >&2
++            sleep "$(( attempt * 5 ))"
++            continue
++        fi
++        return 1
++    done
++    return 1
++}
++
+ sign_macho_files() {
+     local app="$1"
+     local signed=0
+     local candidate
+     while IFS= read -r -d '' candidate; do
+         if file -b "${candidate}" | grep -q "Mach-O"; then
+-            codesign --force --options runtime --timestamp --sign "${SIGN_IDENTITY}" "${candidate}" \
++            codesign_with_retry --force --options runtime --timestamp --sign "${SIGN_IDENTITY}" "${candidate}" \
+                 || { echo "!! codesign failed for ${candidate}"; exit 1; }
+             signed=$((signed + 1))
+         fi
+@@ -200,7 +225,7 @@ if [[ -n "${SIGN_IDENTITY}" ]]; then
+     # reports later as "not signed with a valid Developer ID certificate".
+     sign_macho_files "${APP}"
+     # Then the app bundle itself, carrying the entitlements.
+-    codesign --force --options runtime --timestamp \
++    codesign_with_retry --force --options runtime --timestamp \
+         --entitlements packaging/entitlements.plist \
+         --sign "${SIGN_IDENTITY}" "${APP}"
+     codesign --verify --deep --strict --verbose=2 "${APP}"
+@@ -233,7 +258,7 @@ if [[ "${MAKE_DMG:-0}" == "1" ]]; then
+     # Sign + notarize + staple the distributed .dmg (opt-in).
+     if [[ -n "${SIGN_IDENTITY}" ]]; then
+         echo "==> Codesigning ${DMG}"
+-        codesign --force --timestamp --sign "${SIGN_IDENTITY}" "${DMG}"
++        codesign_with_retry --force --timestamp --sign "${SIGN_IDENTITY}" "${DMG}"
+         echo "==> Signing authority on ${DMG}:"
+         require_developer_id_signature "${DMG}"
+         notarize_and_staple "${DMG}"

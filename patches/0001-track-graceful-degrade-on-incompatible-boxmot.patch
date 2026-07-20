@@ -1,0 +1,70 @@
+Graceful-degrade when boxmot is installed but its tracker API is incompatible.
+
+Upstream _create_boxmot_tracker() falls back from `boxmot.trackers` (>=11 API)
+to the top-level `boxmot.*` classes on ImportError, but a boxmot MAJOR bump
+(e.g. 22.x) removes those top-level classes, so the fallback raises
+AttributeError -- uncaught by `except ImportError` -- and, with no ReID, the
+outer handler re-raises: a hard crash on the first tracked frame. This makes
+ANY boxmot instantiation failure degrade to the built-in _SimpleIoUTracker
+(as the "boxmot not installed" path already does) instead of crashing.
+
+Defence-in-depth on top of the boxmot==19.0.0 pin: the pin keeps the tested
+API, this keeps the app alive if a future resolve drifts. Retire when the
+equivalent fix lands upstream. Worth proposing to AutoPTZ/autoptz.
+
+diff --git a/autoptz/engine/pipeline/track.py b/autoptz/engine/pipeline/track.py
+index 0301643..85f8427 100644
+--- a/autoptz/engine/pipeline/track.py
++++ b/autoptz/engine/pipeline/track.py
+@@ -103,6 +103,23 @@ def _log_fallback_tracker_once() -> None:
+     )
+ 
+ 
++# One-time guard for the "boxmot present but API incompatible" degrade path.
++_LOGGED_INCOMPATIBLE_BOXMOT = False
++
++
++def _log_incompatible_boxmot_once() -> None:
++    global _LOGGED_INCOMPATIBLE_BOXMOT
++    if _LOGGED_INCOMPATIBLE_BOXMOT:
++        return
++    _LOGGED_INCOMPATIBLE_BOXMOT = True
++    log.warning(
++        "boxmot is installed but its tracker API is incompatible (a major "
++        "release likely moved or renamed the tracker classes) — falling back to "
++        "the built-in lightweight IoU tracker. Pin a compatible boxmot to "
++        "restore occlusion-robust BoT-SORT + ReID.",
++    )
++
++
+ # ── Lightweight fallback tracker (no boxmot) ────────────────────────────────────
+ 
+ 
+@@ -351,13 +368,23 @@ def _create_boxmot_tracker(
+     try:
+         tracker = _instantiate(want_reid)
+     except Exception:  # noqa: BLE001
++        # The instantiate() import fallbacks only catch ImportError, so an
++        # incompatible boxmot (e.g. a major bump that moved the tracker classes,
++        # making the top-level ``boxmot.BotSort`` lookup raise AttributeError)
++        # lands here. Degrade to the built-in tracker instead of hard-crashing,
++        # mirroring the "boxmot not installed" path — tracking never hard-fails.
+         if want_reid:
+-            # ReID weights/download failed — fall back to motion-only so tracking
+-            # still works (never let an optional appearance model kill tracking).
++            # ReID weights/download may simply have failed — retry motion-only
++            # before giving up on boxmot entirely.
+             log.warning("ReID init failed; falling back to motion-only tracking.", exc_info=True)
+-            tracker = _instantiate(False)
++            try:
++                tracker = _instantiate(False)
++            except Exception:  # noqa: BLE001
++                _log_incompatible_boxmot_once()
++                return _SimpleIoUTracker(max_age=max_age)
+         else:
+-            raise
++            _log_incompatible_boxmot_once()
++            return _SimpleIoUTracker(max_age=max_age)
+     # BoxMOT re-raises its logger to INFO during construction; re-silence it now
+     # so the per-frame ECC warnings don't reach the console.
+     _quiet_boxmot_logging()
